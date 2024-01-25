@@ -75,7 +75,7 @@ func (scraper *Scraper) getUserId() (int, error) {
 	}
 
 	if len(body.Sites) < 1 {
-		return 0, fmt.Errorf("Expected site, got %d", len(body.Sites))
+		return 0, fmt.Errorf("expected site, got %d", len(body.Sites))
 	}
 
 	return body.Sites[0].ID, nil
@@ -131,25 +131,29 @@ func getCorrectUrl(media Media) (url string) {
 	return media.Responsive_url
 }
 
+func getMediaFilename(media Media) (string, error) {
+	mediaUrl := getCorrectUrl(media)
+
+	parsed, err := url.Parse(mediaUrl)
+	if err != nil {
+		log.Printf("Failed to parse image URL for media %s: %v\n", media.Responsive_url, err)
+		return "", err
+	}
+
+	return path.Base(parsed.Path), nil
+}
+
 func SaveMediaToFile(media Media, folderPath string) error {
 	// Determine if we're saving an image or video
 	mediaUrl := getCorrectUrl(media)
 	mediaUrl = fixUrl(mediaUrl)
 
-	parsed, err := url.Parse(mediaUrl)
+	imageFile, err := getMediaFilename(media)
 	if err != nil {
-		log.Printf("Failed to parse image URL for media %s: %v\n", media.Responsive_url, err)
 		return err
 	}
 
-	imageFile := path.Base(parsed.Path)
-
 	imagePath := path.Join(folderPath, imageFile)
-
-	// Don't save image if it already exists
-	if _, doesNotExist := os.Stat(imagePath); doesNotExist == nil {
-		return nil
-	}
 
 	err = client.DownloadFile(mediaUrl, imagePath)
 	if err != nil {
@@ -162,6 +166,23 @@ func SaveMediaToFile(media Media, folderPath string) error {
 	os.Chtimes(imagePath, imageTime, imageTime)
 
 	return nil
+}
+
+func stripExistingMedia(mediaList imageList, userPath string) (imageList, error) {
+	var strippedList imageList
+
+	for _, media := range mediaList.Media {
+		mediaFilename, err := getMediaFilename(media)
+
+		if err != nil {
+			return imageList{}, err
+		}
+		if _, exists := os.Stat(path.Join(userPath, mediaFilename)); exists != nil {
+			strippedList.Media = append(strippedList.Media, media)
+		}
+	}
+
+	return strippedList, nil
 }
 
 func (scraper *Scraper) SaveAllMedia() error {
@@ -177,6 +198,12 @@ func (scraper *Scraper) SaveAllMedia() error {
 	}
 
 	userPath := path.Join(cwd, scraper.username)
+
+	// Strip our list so we don't save duplicates
+	imagelist, err = stripExistingMedia(imagelist, userPath)
+	if err != nil {
+		return err
+	}
 
 	err = os.MkdirAll(userPath, 0755)
 
