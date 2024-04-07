@@ -23,7 +23,8 @@ var client = httpclient.NewClient()
 // all we care about is the ID
 type sitesResponse struct {
 	Sites []struct {
-		ID int `json:"id"`
+		ID            int    `json:"id"`
+		Profile_image string `json:"profile_image"`
 	} `json:"sites"`
 }
 
@@ -40,12 +41,14 @@ type Media struct {
 }
 
 type Scraper struct {
-	username   string
-	numWorkers int
+	username     string
+	numWorkers   int
+	id           int
+	profileImage string
 }
 
 const (
-	PAGE_SIZE = 100
+	PageSize = 100
 )
 
 func NewScraper(username string, numWorkers int) *Scraper {
@@ -55,50 +58,49 @@ func NewScraper(username string, numWorkers int) *Scraper {
 	}
 }
 
-func (scraper *Scraper) getUserId() (int, error) {
+func (scraper *Scraper) GetUserInfo() error {
 	resp, err := client.Get(fmt.Sprintf("https://vsco.co/api/2.0/sites?subdomain=%s", scraper.username))
 	if err != nil {
-		log.Printf("Failed getting user ID for user %s: %v\n", scraper.username, err)
-		return -1, err
+		log.Printf("Failed getting user info for user %s: %v\n", scraper.username, err)
+		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return -1, fmt.Errorf("Failed to get user ID for user %s: Status %s\n", scraper.username, resp.Status)
+		return fmt.Errorf("Failed to get user info for user %s: Status %s\n", scraper.username, resp.Status)
 	}
 
 	var body sitesResponse
 	err = json.NewDecoder(resp.Body).Decode(&body)
 	if err != nil {
-		log.Printf("Failed to decode JSON ID response for user %s: %v\n", scraper.username, err)
-		return -1, err
+		log.Printf("Failed to decode JSON response for user info %s: %v\n", scraper.username, err)
+		return err
 	}
 
 	if len(body.Sites) < 1 {
-		return 0, fmt.Errorf("expected site, got %d", len(body.Sites))
+		return fmt.Errorf("expected site, got %d", len(body.Sites))
 	}
 
-	return body.Sites[0].ID, nil
+	scraper.id = body.Sites[0].ID
+	scraper.profileImage = body.Sites[0].Profile_image
+
+	return nil
 }
 
 func (scraper *Scraper) fetchImageList() (imageList, error) {
-	id, err := scraper.getUserId()
-	if err != nil {
-		return imageList{}, err
-	}
-
 	var list imageList
 
 	for page := 0; ; page++ {
-		resp, err := client.Get(fmt.Sprintf("https://vsco.co/api/2.0/medias?site_id=%d&size=%d&page=%d", id, PAGE_SIZE, page))
+		resp, err := client.Get(fmt.Sprintf("https://vsco.co/api/2.0/medias?site_id=%d&size=%d&page=%d", scraper.id, PageSize, page))
 		if err != nil {
 			log.Printf("Failed to get image list for user %s (page %d): %v\n", scraper.username, page, err)
 			return imageList{}, err
 		}
-		defer resp.Body.Close()
 
 		var curPage imageList
 		err = json.NewDecoder(resp.Body).Decode(&curPage)
+		resp.Body.Close()
+
 		if err != nil {
 			log.Printf("Failed to decode JSON imagelist response for user %s: %v\n", scraper.username, err)
 			return imageList{}, err
@@ -108,7 +110,7 @@ func (scraper *Scraper) fetchImageList() (imageList, error) {
 		list.Total += curPage.Total
 
 		// No more new pages
-		if len(curPage.Media) < PAGE_SIZE {
+		if len(curPage.Media) < PageSize {
 			break
 		}
 	}
@@ -185,30 +187,39 @@ func stripExistingMedia(mediaList imageList, userPath string) (imageList, error)
 	return strippedList, nil
 }
 
+func createUserDirectory(username string) (string, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		log.Printf("Could not get cwd: %v\n", err)
+		return "", err
+	}
+
+	userPath := path.Join(cwd, username)
+
+	err = os.MkdirAll(userPath, 0755)
+
+	if err != nil {
+		log.Printf("Could not create directory %s: %v\n", userPath, err)
+		return "", err
+	}
+
+	return userPath, nil
+}
+
 func (scraper *Scraper) SaveAllMedia() error {
 	imagelist, err := scraper.fetchImageList()
 	if err != nil {
 		return err
 	}
 
-	cwd, err := os.Getwd()
+	userPath, err := createUserDirectory(scraper.username)
 	if err != nil {
-		log.Printf("Could not get cwd: %v\n", err)
 		return err
 	}
-
-	userPath := path.Join(cwd, scraper.username)
 
 	// Strip our list so we don't save duplicates
 	imagelist, err = stripExistingMedia(imagelist, userPath)
 	if err != nil {
-		return err
-	}
-
-	err = os.MkdirAll(userPath, 0755)
-
-	if err != nil {
-		log.Printf("Could not create directory %s: %v\n", userPath, err)
 		return err
 	}
 
@@ -243,19 +254,42 @@ func (scraper *Scraper) SaveAllMedia() error {
 func GetMediaFromUserlist(list string, numWorkers int) error {
 	file, err := os.Open(list)
 	if err != nil {
-		log.Printf("Failed to open file %s: %v\n", list, err)
-		return err
+		return fmt.Errorf("Failed to open file %s: %v\n", list, err)
 	}
 
 	scanner := bufio.NewScanner(file)
 
 	for scanner.Scan() {
 		scraper := NewScraper(scanner.Text(), numWorkers)
-
-		err := scraper.SaveAllMedia()
+		err := scraper.GetUserInfo()
 		if err != nil {
-			log.Printf("Failed to get images for user %s: %v\n", scraper.SaveAllMedia(), err)
+			return err
 		}
+
+		err = scraper.SaveAllMedia()
+	}
+
+	return nil
+}
+
+func (scraper *Scraper) SaveProfilePicture() error {
+	userPath, err := createUserDirectory(scraper.username)
+	if err != nil {
+		return err
+	}
+
+	profileFolder := path.Join(userPath, "profile")
+
+	err = os.MkdirAll(profileFolder, 0755)
+	if err != nil {
+		log.Printf("Could not create directory %s: %v\n", profileFolder, err)
+		return err
+	}
+
+	err = client.DownloadFile(scraper.profileImage, path.Join(profileFolder, fmt.Sprintf("%s.jpg", scraper.username)))
+	if err != nil {
+		log.Printf("Failed to download profile picture %s: %v\n", scraper.profileImage, err)
+		return err
 	}
 
 	return nil
