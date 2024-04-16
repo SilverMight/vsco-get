@@ -61,8 +61,7 @@ func NewScraper(username string, numWorkers int) *Scraper {
 func (scraper *Scraper) GetUserInfo() error {
 	resp, err := client.Get(fmt.Sprintf("https://vsco.co/api/2.0/sites?subdomain=%s", scraper.username))
 	if err != nil {
-		log.Printf("Failed getting user info for user %s: %v\n", scraper.username, err)
-		return err
+		return fmt.Errorf("Failed getting user info for user %s: %w\n", scraper.username, err)
 	}
 	defer resp.Body.Close()
 
@@ -73,12 +72,11 @@ func (scraper *Scraper) GetUserInfo() error {
 	var body sitesResponse
 	err = json.NewDecoder(resp.Body).Decode(&body)
 	if err != nil {
-		log.Printf("Failed to decode JSON response for user info %s: %v\n", scraper.username, err)
-		return err
+		return fmt.Errorf("Failed to decode JSON response for user info %s: %w\n", scraper.username, err)
 	}
 
 	if len(body.Sites) < 1 {
-		return fmt.Errorf("expected site, got %d", len(body.Sites))
+		return fmt.Errorf("Expected site, got %d", len(body.Sites))
 	}
 
 	scraper.id = body.Sites[0].ID
@@ -93,8 +91,7 @@ func (scraper *Scraper) fetchImageList() (imageList, error) {
 	for page := 0; ; page++ {
 		resp, err := client.Get(fmt.Sprintf("https://vsco.co/api/2.0/medias?site_id=%d&size=%d&page=%d", scraper.id, PageSize, page))
 		if err != nil {
-			log.Printf("Failed to get image list for user %s (page %d): %v\n", scraper.username, page, err)
-			return imageList{}, err
+			return imageList{}, fmt.Errorf("Failed to get image list for user %s (page %d): %w\n", scraper.username, page, err)
 		}
 
 		var curPage imageList
@@ -102,8 +99,7 @@ func (scraper *Scraper) fetchImageList() (imageList, error) {
 		resp.Body.Close()
 
 		if err != nil {
-			log.Printf("Failed to decode JSON imagelist response for user %s: %v\n", scraper.username, err)
-			return imageList{}, err
+			return imageList{}, fmt.Errorf("Failed to decode JSON imagelist response for user %s: %w\n", scraper.username, err)
 		}
 
 		list.Media = append(list.Media, curPage.Media...)
@@ -138,8 +134,7 @@ func getMediaFilename(media Media) (string, error) {
 
 	parsed, err := url.Parse(mediaUrl)
 	if err != nil {
-		log.Printf("Failed to parse image URL for media %s: %v\n", media.Responsive_url, err)
-		return "", err
+		return "", fmt.Errorf("Failed to parse image URL for media %s: %w\n", media.Responsive_url, err)
 	}
 
 	return path.Base(parsed.Path), nil
@@ -159,8 +154,7 @@ func SaveMediaToFile(media Media, folderPath string) error {
 
 	err = client.DownloadFile(mediaUrl, imagePath)
 	if err != nil {
-		log.Printf("Failed to download image %s: %v\n", mediaUrl, err)
-		return err
+		return fmt.Errorf("Failed to download image %s: %w\n", mediaUrl, err)
 	}
 
 	// We care about the modification time
@@ -179,6 +173,7 @@ func stripExistingMedia(mediaList imageList, userPath string) (imageList, error)
 		if err != nil {
 			return imageList{}, err
 		}
+
 		if _, exists := os.Stat(path.Join(userPath, mediaFilename)); exists != nil {
 			strippedList.Media = append(strippedList.Media, media)
 		}
@@ -190,8 +185,7 @@ func stripExistingMedia(mediaList imageList, userPath string) (imageList, error)
 func createUserDirectory(username string) (string, error) {
 	cwd, err := os.Getwd()
 	if err != nil {
-		log.Printf("Could not get cwd: %v\n", err)
-		return "", err
+		return "", fmt.Errorf("Could not get cwd: %w\n", err)
 	}
 
 	userPath := path.Join(cwd, username)
@@ -199,8 +193,7 @@ func createUserDirectory(username string) (string, error) {
 	err = os.MkdirAll(userPath, 0755)
 
 	if err != nil {
-		log.Printf("Could not create directory %s: %v\n", userPath, err)
-		return "", err
+		return "", fmt.Errorf("Could not create directory %s: %w\n", userPath, err)
 	}
 
 	return userPath, nil
@@ -241,7 +234,7 @@ func (scraper *Scraper) SaveAllMedia() error {
 			err := SaveMediaToFile(media, userPath)
 			// Keeps going and logs if one fails (maybe make threshold of failures)
 			if err != nil {
-				log.Printf("Error downloading %v\n", err)
+				log.Print(err)
 			}
 		}(media)
 	}
@@ -251,22 +244,34 @@ func (scraper *Scraper) SaveAllMedia() error {
 	return nil
 }
 
-func GetMediaFromUserlist(list string, numWorkers int) error {
+func GetMediaFromUserlist(list string, numWorkers int, saveProfilePictures bool) error {
 	file, err := os.Open(list)
 	if err != nil {
-		return fmt.Errorf("Failed to open file %s: %v\n", list, err)
+		return fmt.Errorf("Failed to open file %s: %w\n", list, err)
 	}
 
 	scanner := bufio.NewScanner(file)
 
 	for scanner.Scan() {
 		scraper := NewScraper(scanner.Text(), numWorkers)
+
 		err := scraper.GetUserInfo()
 		if err != nil {
-			return err
+			continue
 		}
 
-		err = scraper.SaveAllMedia()
+		// We don't stop for just one error
+		if saveProfilePictures {
+			err = scraper.SaveProfilePicture()
+			if err != nil {
+				log.Print(err)
+			}
+		} else {
+			err = scraper.SaveAllMedia()
+			if err != nil {
+				log.Print(err)
+			}
+		}
 	}
 
 	return nil
@@ -280,17 +285,32 @@ func (scraper *Scraper) SaveProfilePicture() error {
 
 	profileFolder := path.Join(userPath, "profile")
 
+	bar := progressbar.Default(1, fmt.Sprintf("Downloading profile picture of %s...", scraper.username))
+
 	err = os.MkdirAll(profileFolder, 0755)
 	if err != nil {
-		log.Printf("Could not create directory %s: %v\n", profileFolder, err)
-		return err
+		return fmt.Errorf("Could not create directory %s: %w\n", profileFolder, err)
 	}
 
-	err = client.DownloadFile(scraper.profileImage, path.Join(profileFolder, fmt.Sprintf("%s.jpg", scraper.username)))
+	u, err := url.Parse(scraper.profileImage)
 	if err != nil {
-		log.Printf("Failed to download profile picture %s: %v\n", scraper.profileImage, err)
-		return err
+		return fmt.Errorf("Failed to parse profile image URL %s: %w\n", scraper.profileImage, err)
 	}
+
+	// Delete width and height params
+	q := u.Query()
+	q.Del("w")
+	q.Del("h")
+
+	u.RawQuery = q.Encode()
+	fixedURL := u.String()
+
+	err = client.DownloadFile(fixedURL, path.Join(profileFolder, fmt.Sprintf("%s.jpg", scraper.username)))
+	if err != nil {
+		return fmt.Errorf("Failed to download profile picture %s: %w\n", scraper.profileImage, err)
+	}
+
+	bar.Add(1)
 
 	return nil
 }

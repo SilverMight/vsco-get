@@ -36,7 +36,7 @@ func main() {
 			}
 		}
 	} else if *usernameList != "" {
-		err := vsco.GetMediaFromUserlist(*usernameList, *numWorkers)
+		err := vsco.GetMediaFromUserlist(*usernameList, *numWorkers, *getProfilePicture)
 		if err != nil {
 			log.Fatal(err)
 		}
