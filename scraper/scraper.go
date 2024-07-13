@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -137,7 +138,11 @@ func getMediaFilename(media Media) (string, error) {
 		return "", fmt.Errorf("Failed to parse image URL for media %s: %w\n", media.Responsive_url, err)
 	}
 
-	return path.Base(parsed.Path), nil
+	// Trim to unix seconds
+	uploadDate := strconv.Itoa(media.Upload_date)[:10]
+
+	fileExt := path.Ext(parsed.Path)
+	return fmt.Sprintf("%s%s", uploadDate, fileExt), nil
 }
 
 func SaveMediaToFile(media Media, folderPath string) error {
