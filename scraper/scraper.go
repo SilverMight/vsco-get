@@ -30,8 +30,14 @@ type sitesResponse struct {
 }
 
 type imageList struct {
-	Media []Media `json:"media"`
-	Total int     `json:"total"`
+	Media       []MediaWrapper `json:"media"`
+	Total       int            `json:"total"`
+	Next_cursor string         `json:"next_cursor"`
+}
+
+type MediaWrapper struct {
+	Type  string `json:"type"`
+	Media Media  `json:"-"`
 }
 
 type Media struct {
@@ -39,6 +45,32 @@ type Media struct {
 	Video_url      string `json:"video_url"`
 	Responsive_url string `json:"responsive_url"`
 	Upload_date    int    `json:"upload_date"`
+}
+
+func (mw *MediaWrapper) UnmarshalJSON(data []byte) error {
+	var rawJson map[string]json.RawMessage
+
+	if err := json.Unmarshal(data, &rawJson); err != nil {
+		return err
+	}
+
+	if typeBytes, exists := rawJson["type"]; exists {
+		if err := json.Unmarshal(typeBytes, &mw.Type); err != nil {
+			return err
+		}
+	}
+
+	mediaBytes, exists := rawJson[mw.Type]
+
+	if !exists {
+		return fmt.Errorf("Missing key matching media type: %s", mw.Type)
+	}
+
+	if err := json.Unmarshal(mediaBytes, &mw.Media); err != nil {
+		return fmt.Errorf("Failed to unmarshal media of type %s: %w", mw.Type, err)
+	}
+
+	return nil
 }
 
 type Scraper struct {
@@ -86,28 +118,33 @@ func (scraper *Scraper) GetUserInfo() error {
 	return nil
 }
 
-func (scraper *Scraper) fetchImageList() (imageList, error) {
-	var list imageList
+func (scraper *Scraper) fetchImageList() ([]Media, error) {
+	var list []Media
 
-	for page := 0; ; page++ {
-		resp, err := client.Get(fmt.Sprintf("https://vsco.co/api/2.0/medias?site_id=%d&size=%d&page=%d", scraper.id, PageSize, page))
+	nextCursor := ""
+	for page := 1; ; page++ {
+		url := fmt.Sprintf("https://vsco.co/api/3.0/medias/profile?site_id=%d&limit=%d&cursor=%s", scraper.id, PageSize, nextCursor)
+		resp, err := client.Get(url)
 		if err != nil {
-			return imageList{}, fmt.Errorf("Failed to get image list for user %s (page %d): %w\n", scraper.username, page, err)
+			return nil, fmt.Errorf("Failed to get image list for user %s (page %d): %w\n", scraper.username, page, err)
 		}
 
 		var curPage imageList
 		err = json.NewDecoder(resp.Body).Decode(&curPage)
 		resp.Body.Close()
 
+		nextCursor = curPage.Next_cursor
+
 		if err != nil {
-			return imageList{}, fmt.Errorf("Failed to decode JSON imagelist response for user %s: %w\n", scraper.username, err)
+			return nil, fmt.Errorf("Failed to decode JSON imagelist response for user %s: %w\n", scraper.username, err)
 		}
 
-		list.Media = append(list.Media, curPage.Media...)
-		list.Total += curPage.Total
+		for _, item := range curPage.Media {
+			list = append(list, item.Media)
+		}
 
 		// No more new pages
-		if len(curPage.Media) < PageSize {
+		if nextCursor == "" {
 			break
 		}
 	}
@@ -169,18 +206,18 @@ func SaveMediaToFile(media Media, folderPath string) error {
 	return nil
 }
 
-func stripExistingMedia(mediaList imageList, userPath string) (imageList, error) {
-	var strippedList imageList
+func stripExistingMedia(mediaList []Media, userPath string) ([]Media, error) {
+	var strippedList []Media
 
-	for _, media := range mediaList.Media {
+	for _, media := range mediaList {
 		mediaFilename, err := getMediaFilename(media)
 
 		if err != nil {
-			return imageList{}, err
+			return nil, err
 		}
 
 		if _, exists := os.Stat(path.Join(userPath, mediaFilename)); exists != nil {
-			strippedList.Media = append(strippedList.Media, media)
+			strippedList = append(strippedList, media)
 		}
 	}
 
@@ -205,7 +242,7 @@ func createUserDirectory(username string) (string, error) {
 }
 
 func (scraper *Scraper) SaveAllMedia() error {
-	imagelist, err := scraper.fetchImageList()
+	mediaList, err := scraper.fetchImageList()
 	if err != nil {
 		return err
 	}
@@ -216,7 +253,7 @@ func (scraper *Scraper) SaveAllMedia() error {
 	}
 
 	// Strip our list so we don't save duplicates
-	imagelist, err = stripExistingMedia(imagelist, userPath)
+	mediaList, err = stripExistingMedia(mediaList, userPath)
 	if err != nil {
 		return err
 	}
@@ -225,8 +262,8 @@ func (scraper *Scraper) SaveAllMedia() error {
 	var sem = make(chan int, scraper.numWorkers)
 	var wg sync.WaitGroup
 
-	bar := progressbar.Default(int64(len(imagelist.Media)), fmt.Sprintf("Downloading images from %s...", scraper.username))
-	for _, media := range imagelist.Media {
+	bar := progressbar.Default(int64(len(mediaList)), fmt.Sprintf("Downloading images from %s...", scraper.username))
+	for _, media := range mediaList {
 		sem <- 1
 		wg.Add(1)
 		go func(media Media) {
