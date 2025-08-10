@@ -4,24 +4,24 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/SilverMight/vsco-get/httpclient"
-
 	"github.com/schollz/progressbar/v3"
 )
 
+const databaseFile = "vscoget-user-database.txt"
+
 var client = httpclient.NewClient()
 
-// all we care about is the ID
 type sitesResponse struct {
 	Sites []struct {
 		ID            int    `json:"id"`
@@ -29,28 +29,207 @@ type sitesResponse struct {
 	} `json:"sites"`
 }
 
+type Media struct {
+	ID              string `json:"_id"`
+	Is_video        bool   `json:"is_video"`
+	Video_url       string `json:"video_url,omitempty"`
+	Responsive_url  string `json:"responsive_url"`
+	Upload_date     int64  `json:"upload_date"`
+	Perma_subdomain string `json:"perma_subdomain"`
+}
+
+type MediaResponse struct {
+	Media []Media `json:"media"`
+}
+
 type imageList struct {
 	Media []Media `json:"media"`
 	Total int     `json:"total"`
 }
 
-type Media struct {
-	Is_video       bool   `json:"is_video"`
-	Video_url      string `json:"video_url"`
-	Responsive_url string `json:"responsive_url"`
-	Upload_date    int    `json:"upload_date"`
-}
-
 type Scraper struct {
 	username     string
 	numWorkers   int
-	id           int
+	id          int
 	profileImage string
 }
 
 const (
-	PageSize = 100
+	PageSize   = 30
+	retryCount = 3
+	retryDelay = 2 * time.Second
 )
+
+func (scraper *Scraper) ID() string {
+    return fmt.Sprintf("%d", scraper.id)
+}
+
+func GetUsernameFromSiteID(siteID string) (string, error) {
+	url := fmt.Sprintf("https://vsco.co/api/2.0/medias?site_id=%s&size=1", siteID)
+	resp, err := client.Get(url)
+	if err != nil {
+		return "", fmt.Errorf("failed to make request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	var mediaResp MediaResponse
+	if err := json.Unmarshal(bodyBytes, &mediaResp); err != nil {
+		return "", fmt.Errorf("failed to decode JSON: %w", err)
+	}
+
+	if len(mediaResp.Media) == 0 {
+		return "", fmt.Errorf("no media found for site ID %s", siteID)
+	}
+
+	if mediaResp.Media[0].Perma_subdomain == "" {
+		return "", fmt.Errorf("empty perma_subdomain in response")
+	}
+
+	return mediaResp.Media[0].Perma_subdomain, nil
+}
+
+func GetInfoFromMediaID(mediaID string) (string, string, error) {
+    mediaUrl := fmt.Sprintf("https://vsco.co/vsco/media/%s", mediaID)
+    req, err := http.NewRequest("GET", mediaUrl, nil)
+    if err != nil {
+        return "", "", fmt.Errorf("failed to create request: %w", err)
+    }
+
+    req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0")
+    req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+
+    client := http.Client{}
+    resp, err := client.Do(req)
+    if err != nil {
+        return "", "", fmt.Errorf("failed to make request: %w", err)
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != http.StatusOK {
+        return "", "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+    }
+
+    bodyBytes, err := io.ReadAll(resp.Body)
+    if err != nil {
+        return "", "", fmt.Errorf("failed to read response body: %w", err)
+    }
+
+    // Search for permaSubdomain in the HTML
+    htmlContent := string(bodyBytes)
+    permaSubdomain := extractPermaSubdomain(htmlContent)
+    if permaSubdomain == "" {
+        return "", "", fmt.Errorf("could not find permaSubdomain in HTML")
+    }
+
+    fmt.Printf("Found permaSubdomain: %s\n", permaSubdomain)
+
+    siteID, err := GetSiteIDFromUsername(permaSubdomain)
+    if err != nil {
+        return "", "", fmt.Errorf("failed to get site ID: %w", err)
+    }
+
+    return permaSubdomain, siteID, nil
+}
+
+func extractPermaSubdomain(html string) string {
+    // Look for the permaSubdomain pattern in the HTML
+    prefix := `"permaSubdomain":"`
+    start := strings.Index(html, prefix)
+    if start == -1 {
+        return ""
+    }
+    start += len(prefix)
+    end := strings.Index(html[start:], `"`)
+    if end == -1 {
+        return ""
+    }
+    return html[start : start+end]
+}
+
+func GetSiteIDFromUsername(username string) (string, error) {
+	url := fmt.Sprintf("https://vsco.co/api/2.0/sites?subdomain=%s", username)
+	resp, err := client.Get(url)
+	if err != nil {
+		return "", fmt.Errorf("failed to make request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	var body sitesResponse
+	if err := json.Unmarshal(bodyBytes, &body); err != nil {
+		return "", fmt.Errorf("failed to decode JSON: %w", err)
+	}
+
+	if len(body.Sites) == 0 {
+		return "", fmt.Errorf("no site found for username %s", username)
+	}
+
+	return fmt.Sprintf("%d", body.Sites[0].ID), nil
+}
+
+func UpdateDatabaseWithSiteID(username, siteID string) error {
+	file, err := os.OpenFile(databaseFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open database file: %w", err)
+	}
+	defer file.Close()
+
+	entry := fmt.Sprintf("%s | %s\n", username, siteID)
+	if _, err := file.WriteString(entry); err != nil {
+		return fmt.Errorf("failed to write to database: %w", err)
+	}
+
+	return nil
+}
+
+func updateDatabase(username string, siteID int, status string) error {
+	file, err := os.ReadFile(databaseFile)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to read database: %w", err)
+	}
+
+	lines := strings.Split(string(file), "\n")
+	newLines := make([]string, 0, len(lines)+1)
+	found := false
+
+	newEntry := fmt.Sprintf("%s | %d", username, siteID)
+	if status != "" {
+		newEntry += fmt.Sprintf(" | %s", status)
+	}
+
+	for _, line := range lines {
+		parts := strings.Split(line, "|")
+		if len(parts) > 0 && strings.TrimSpace(parts[0]) == username {
+			newLines = append(newLines, newEntry)
+			found = true
+		} else if line != "" {
+			newLines = append(newLines, line)
+		}
+	}
+
+	if !found {
+		newLines = append(newLines, newEntry)
+	}
+
+	return os.WriteFile(databaseFile, []byte(strings.Join(newLines, "\n")), 0644)
+}
 
 func NewScraper(username string, numWorkers int) *Scraper {
 	return &Scraper{
@@ -59,227 +238,180 @@ func NewScraper(username string, numWorkers int) *Scraper {
 	}
 }
 
-func (scraper *Scraper) GetUserInfo() error {
-	resp, err := client.Get(fmt.Sprintf("https://vsco.co/api/2.0/sites?subdomain=%s", scraper.username))
-	if err != nil {
-		return fmt.Errorf("Failed getting user info for user %s: %w\n", scraper.username, err)
-	}
-	defer resp.Body.Close()
+func (scraper *Scraper) GetUserInfo() (bool, error) {
+    url := fmt.Sprintf("https://vsco.co/api/2.0/sites?subdomain=%s", scraper.username)
+    resp, err := client.Get(url)
+    if err != nil {
+        return false, fmt.Errorf("failed to make request: %w", err)
+    }
+    defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("Failed to get user info for user %s: Status %s\n", scraper.username, resp.Status)
-	}
+    if resp.StatusCode == http.StatusNotFound {
+        return false, nil // User not found, but not an error
+    }
 
-	var body sitesResponse
-	err = json.NewDecoder(resp.Body).Decode(&body)
-	if err != nil {
-		return fmt.Errorf("Failed to decode JSON response for user info %s: %w\n", scraper.username, err)
-	}
+    if resp.StatusCode != http.StatusOK {
+        return false, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+    }
 
-	if len(body.Sites) < 1 {
-		return fmt.Errorf("Expected site, got %d", len(body.Sites))
-	}
+    bodyBytes, err := io.ReadAll(resp.Body)
+    if err != nil {
+        return false, fmt.Errorf("failed to read response body: %w", err)
+    }
 
-	scraper.id = body.Sites[0].ID
-	scraper.profileImage = body.Sites[0].Profile_image
+    var body sitesResponse
+    if err := json.Unmarshal(bodyBytes, &body); err != nil {
+        return false, fmt.Errorf("failed to decode JSON: %w", err)
+    }
 
-	return nil
+    if len(body.Sites) == 0 {
+        return false, nil // User not found, but not an error
+    }
+
+    scraper.id = body.Sites[0].ID
+    scraper.profileImage = body.Sites[0].Profile_image
+    return true, nil // User found
 }
 
-func (scraper *Scraper) fetchImageList() (imageList, error) {
-	var list imageList
+func (scraper *Scraper) fetchMedia() ([]Media, error) {
+	var allMedia []Media
 
 	for page := 0; ; page++ {
-		resp, err := client.Get(fmt.Sprintf("https://vsco.co/api/2.0/medias?site_id=%d&size=%d&page=%d", scraper.id, PageSize, page))
+		log.Printf("Fetching page %d...", page+1)
+		url := fmt.Sprintf("https://vsco.co/api/2.0/medias?site_id=%d&size=%d&page=%d", scraper.id, PageSize, page)
+		
+		var resp *http.Response
+		var err error
+		
+		for i := 0; i < retryCount; i++ {
+			resp, err = client.Get(url)
+			if err == nil && resp.StatusCode == http.StatusOK {
+				break
+			}
+			if i < retryCount-1 {
+				time.Sleep(retryDelay)
+			}
+		}
+		
 		if err != nil {
-			return imageList{}, fmt.Errorf("Failed to get image list for user %s (page %d): %w\n", scraper.username, page, err)
+			return nil, fmt.Errorf("failed to get media list: %w", err)
 		}
 
-		var curPage imageList
-		err = json.NewDecoder(resp.Body).Decode(&curPage)
+		var mediaResp MediaResponse
+		if err := json.NewDecoder(resp.Body).Decode(&mediaResp); err != nil {
+			resp.Body.Close()
+			return nil, fmt.Errorf("failed to decode media response: %w", err)
+		}
 		resp.Body.Close()
 
-		if err != nil {
-			return imageList{}, fmt.Errorf("Failed to decode JSON imagelist response for user %s: %w\n", scraper.username, err)
-		}
+		allMedia = append(allMedia, mediaResp.Media...)
+		log.Printf("Page %d: Found %d media items (Total: %d)", page+1, len(mediaResp.Media), len(allMedia))
 
-		list.Media = append(list.Media, curPage.Media...)
-		list.Total += curPage.Total
-
-		// No more new pages
-		if len(curPage.Media) < PageSize {
+		if len(mediaResp.Media) < PageSize {
 			break
 		}
 	}
 
-	return list, nil
+	return allMedia, nil
 }
 
-// vsco returns us links that doesn't have https:// in front of it
-func fixUrl(rawUrl string) (fixedUrl string) {
-	if strings.HasPrefix(rawUrl, "https://") {
-		return rawUrl
-	}
-	return "https://" + rawUrl
-}
-
-func getCorrectUrl(media Media) (url string) {
-	if media.Is_video {
+func getMediaUrl(media Media) string {
+	if media.Is_video && media.Video_url != "" {
+		if !strings.HasPrefix(media.Video_url, "http") {
+			return "https://" + media.Video_url
+		}
 		return media.Video_url
+	}
+	
+	if !strings.HasPrefix(media.Responsive_url, "http") {
+		return "https://" + media.Responsive_url
 	}
 	return media.Responsive_url
 }
 
 func getMediaFilename(media Media) (string, error) {
-	mediaUrl := getCorrectUrl(media)
-
-	parsed, err := url.Parse(mediaUrl)
-	if err != nil {
-		return "", fmt.Errorf("Failed to parse image URL for media %s: %w\n", media.Responsive_url, err)
-	}
-
-	// Trim to unix seconds
-	uploadDate := strconv.Itoa(media.Upload_date)[:10]
-
-	fileExt := path.Ext(parsed.Path)
-	return fmt.Sprintf("%s%s", uploadDate, fileExt), nil
+    return media.ID, nil
 }
 
 func SaveMediaToFile(media Media, folderPath string) error {
-	// Determine if we're saving an image or video
-	mediaUrl := getCorrectUrl(media)
-	mediaUrl = fixUrl(mediaUrl)
+    mediaUrl := getMediaUrl(media)
+    parsed, err := url.Parse(mediaUrl)
+    if err != nil {
+        return fmt.Errorf("failed to parse media URL: %w", err)
+    }
 
-	imageFile, err := getMediaFilename(media)
-	if err != nil {
-		return err
-	}
+    fileExt := path.Ext(parsed.Path)
+    if fileExt == "" {
+        if media.Is_video {
+            fileExt = ".mp4"
+        } else {
+            fileExt = ".jpg"
+        }
+    }
+    
+    filename := media.ID + fileExt
+    filePath := path.Join(folderPath, filename)
 
-	imagePath := path.Join(folderPath, imageFile)
+    err = client.DownloadFile(mediaUrl, filePath)
+    if err != nil {
+        return fmt.Errorf("failed to download %s: %w", mediaUrl, err)
+    }
 
-	err = client.DownloadFile(mediaUrl, imagePath)
-	if err != nil {
-		return fmt.Errorf("Failed to download image %s: %w\n", mediaUrl, err)
-	}
+    uploadTime := time.Unix(media.Upload_date/1000, 0)
+    os.Chtimes(filePath, uploadTime, uploadTime)
 
-	// We care about the modification time
-	imageTime := time.Unix(int64(media.Upload_date)/int64(1000), 0)
-	os.Chtimes(imagePath, imageTime, imageTime)
-
-	return nil
-}
-
-func stripExistingMedia(mediaList imageList, userPath string) (imageList, error) {
-	var strippedList imageList
-
-	for _, media := range mediaList.Media {
-		mediaFilename, err := getMediaFilename(media)
-
-		if err != nil {
-			return imageList{}, err
-		}
-
-		if _, exists := os.Stat(path.Join(userPath, mediaFilename)); exists != nil {
-			strippedList.Media = append(strippedList.Media, media)
-		}
-	}
-
-	return strippedList, nil
+    return nil
 }
 
 func createUserDirectory(username string) (string, error) {
-	cwd, err := os.Getwd()
-	if err != nil {
-		return "", fmt.Errorf("Could not get cwd: %w\n", err)
+	userPath := path.Join(".", username)
+	if err := os.MkdirAll(userPath, 0755); err != nil {
+		return "", fmt.Errorf("failed to create directory: %w", err)
 	}
-
-	userPath := path.Join(cwd, username)
-
-	err = os.MkdirAll(userPath, 0755)
-
-	if err != nil {
-		return "", fmt.Errorf("Could not create directory %s: %w\n", userPath, err)
-	}
-
 	return userPath, nil
 }
 
 func (scraper *Scraper) SaveAllMedia() error {
-	imagelist, err := scraper.fetchImageList()
-	if err != nil {
-		return err
-	}
+    mediaList, err := scraper.fetchMedia()
+    if err != nil {
+        return err
+    }
 
-	userPath, err := createUserDirectory(scraper.username)
-	if err != nil {
-		return err
-	}
+    userPath, err := createUserDirectory(scraper.username)
+    if err != nil {
+        return err
+    }
 
-	// Strip our list so we don't save duplicates
-	imagelist, err = stripExistingMedia(imagelist, userPath)
-	if err != nil {
-		return err
-	}
+    // Filter out existing files
+    filteredMedia, err := stripExistingMedia(mediaList, userPath)
+    if err != nil {
+        return err
+    }
 
-	// Dumb concurrency
-	var sem = make(chan int, scraper.numWorkers)
-	var wg sync.WaitGroup
+    var wg sync.WaitGroup
+    sem := make(chan struct{}, scraper.numWorkers)
+    bar := progressbar.Default(int64(len(filteredMedia)), 
+        fmt.Sprintf("Downloading new media for %s...", scraper.username))
 
-	bar := progressbar.Default(int64(len(imagelist.Media)), fmt.Sprintf("Downloading images from %s...", scraper.username))
-	for _, media := range imagelist.Media {
-		sem <- 1
-		wg.Add(1)
-		go func(media Media) {
-			defer func() {
-				<-sem
-				wg.Done()
-				bar.Add(1)
-			}()
+    for _, media := range filteredMedia {
+        wg.Add(1)
+        sem <- struct{}{}
 
-			err := SaveMediaToFile(media, userPath)
-			// Keeps going and logs if one fails (maybe make threshold of failures)
-			if err != nil {
-				log.Print(err)
-			}
-		}(media)
-	}
+        go func(m Media) {
+            defer func() {
+                <-sem
+                wg.Done()
+                bar.Add(1)
+            }()
 
-	wg.Wait()
+            if err := SaveMediaToFile(m, userPath); err != nil {
+                log.Printf("Error downloading %s: %v", m.ID, err)
+            }
+        }(media)
+    }
 
-	return nil
-}
-
-func GetMediaFromUserlist(list string, numWorkers int, saveProfilePictures bool) error {
-	file, err := os.Open(list)
-	if err != nil {
-		return fmt.Errorf("Failed to open file %s: %w\n", list, err)
-	}
-
-	scanner := bufio.NewScanner(file)
-
-	for scanner.Scan() {
-		scraper := NewScraper(scanner.Text(), numWorkers)
-
-		err := scraper.GetUserInfo()
-		if err != nil {
-			continue
-		}
-
-		// We don't stop for just one error
-		if saveProfilePictures {
-			err = scraper.SaveProfilePicture()
-			if err != nil {
-				log.Print(err)
-			}
-		} else {
-			err = scraper.SaveAllMedia()
-			if err != nil {
-				log.Print(err)
-			}
-		}
-	}
-
-	return nil
+    wg.Wait()
+    return nil
 }
 
 func (scraper *Scraper) SaveProfilePicture() error {
@@ -288,34 +420,101 @@ func (scraper *Scraper) SaveProfilePicture() error {
 		return err
 	}
 
-	profileFolder := path.Join(userPath, "profile")
-
-	bar := progressbar.Default(1, fmt.Sprintf("Downloading profile picture of %s...", scraper.username))
-
-	err = os.MkdirAll(profileFolder, 0755)
-	if err != nil {
-		return fmt.Errorf("Could not create directory %s: %w\n", profileFolder, err)
+	profilePath := path.Join(userPath, "profile")
+	if err := os.MkdirAll(profilePath, 0755); err != nil {
+		return fmt.Errorf("failed to create profile directory: %w", err)
 	}
 
 	u, err := url.Parse(scraper.profileImage)
 	if err != nil {
-		return fmt.Errorf("Failed to parse profile image URL %s: %w\n", scraper.profileImage, err)
+		return fmt.Errorf("failed to parse profile image URL: %w", err)
 	}
 
-	// Delete width and height params
 	q := u.Query()
 	q.Del("w")
 	q.Del("h")
-
 	u.RawQuery = q.Encode()
-	fixedURL := u.String()
 
-	err = client.DownloadFile(fixedURL, path.Join(profileFolder, fmt.Sprintf("%s.jpg", scraper.username)))
+	filePath := path.Join(profilePath, fmt.Sprintf("%s.jpg", scraper.username))
+	return client.DownloadFile(u.String(), filePath)
+}
+
+func stripExistingMedia(mediaList []Media, userPath string) ([]Media, error) {
+    var strippedList []Media
+    existingFiles := make(map[string]bool)
+
+    // First check the main directory
+    files, err := os.ReadDir(userPath)
+    if err == nil {
+        for _, file := range files {
+            if !file.IsDir() {
+                // Get base filename without extension
+                baseName := strings.TrimSuffix(file.Name(), path.Ext(file.Name()))
+                existingFiles[baseName] = true
+            }
+        }
+    }
+
+    // Then check the profile subdirectory if it exists
+    profilePath := path.Join(userPath, "profile")
+    profileFiles, err := os.ReadDir(profilePath)
+    if err == nil {
+        for _, file := range profileFiles {
+            if !file.IsDir() {
+                baseName := strings.TrimSuffix(file.Name(), path.Ext(file.Name()))
+                existingFiles[baseName] = true
+            }
+        }
+    }
+
+    // Filter out existing media
+    for _, media := range mediaList {
+        if !existingFiles[media.ID] {
+            strippedList = append(strippedList, media)
+        }
+    }
+
+    log.Printf("Filtered %d existing files, %d new files to download", 
+        len(mediaList)-len(strippedList), len(strippedList))
+    
+    return strippedList, nil
+}
+
+func GetMediaFromUserlist(listPath string, numWorkers int, getProfilePictures bool) error {
+	file, err := os.Open(listPath)
 	if err != nil {
-		return fmt.Errorf("Failed to download profile picture %s: %w\n", scraper.profileImage, err)
+		return fmt.Errorf("failed to open userlist: %w", err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		username := strings.TrimSpace(scanner.Text())
+		if username == "" {
+			continue
+		}
+
+		scraper := NewScraper(username, numWorkers)
+		found, err := scraper.GetUserInfo()
+		if err != nil {
+			log.Printf("Error getting user info for %s: %v", username, err)
+			continue
+		}
+		if !found {
+			log.Printf("User %s not found", username)
+			continue
+		}
+
+		if getProfilePictures {
+			if err := scraper.SaveProfilePicture(); err != nil {
+				log.Printf("Error saving profile picture for %s: %v", username, err)
+			}
+		} else {
+			if err := scraper.SaveAllMedia(); err != nil {
+				log.Printf("Error saving media for %s: %v", username, err)
+			}
+		}
 	}
 
-	bar.Add(1)
-
-	return nil
+	return scanner.Err()
 }
