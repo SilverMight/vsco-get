@@ -29,25 +29,114 @@ type sitesResponse struct {
 	} `json:"sites"`
 }
 
-type imageList struct {
-	Media       []MediaWrapper `json:"media"`
+type mediaList struct {
+	Media       []mediaWrapper `json:"media"`
 	Total       int            `json:"total"`
 	Next_cursor string         `json:"next_cursor"`
 }
 
-type MediaWrapper struct {
-	Type  string `json:"type"`
-	Media Media  `json:"-"`
+type mediaWrapper struct {
+	Type  string    `json:"type"`
+	Media mediaItem `json:"-"`
 }
 
-type Media struct {
+// mediaItem interface for handling different media types
+type mediaItem interface {
+	GetURL() string
+	GetUploadDate() int64
+	GetFilename() (string, error)
+	IsVideo() bool
+	Save(folderPath string) error
+}
+
+// Image content or old-style videos
+type imageMedia struct {
 	Is_video       bool   `json:"is_video"`
 	Video_url      string `json:"video_url"`
 	Responsive_url string `json:"responsive_url"`
 	Upload_date    int    `json:"upload_date"`
 }
 
-func (mw *MediaWrapper) UnmarshalJSON(data []byte) error {
+func (i imageMedia) GetURL() string {
+	if i.Is_video {
+		return i.Video_url
+	}
+
+	return i.Responsive_url
+}
+
+func (i imageMedia) GetUploadDate() int64 {
+	return int64(i.Upload_date)
+}
+
+func (i imageMedia) IsVideo() bool {
+	return i.Is_video
+}
+
+func (i imageMedia) GetFilename() (string, error) {
+	mediaUrl := i.GetURL()
+
+	parsed, err := url.Parse(mediaUrl)
+	if err != nil {
+		return "", fmt.Errorf("Failed to parse image URL %s: %w", mediaUrl, err)
+	}
+
+	// Trim to unix seconds
+	uploadDate := strconv.FormatInt(i.GetUploadDate(), 10)
+	const trimLength = 10
+	if len(uploadDate) > trimLength {
+		uploadDate = uploadDate[:trimLength]
+	}
+
+	fileExt := path.Ext(parsed.Path)
+
+	return fmt.Sprintf("%s%s", uploadDate, fileExt), nil
+}
+
+func (i imageMedia) Save(folderPath string) error {
+	return saveMediaToFile(i, folderPath)
+}
+
+// New style videos, typically stored in m3u8 playlists
+// NOTE: saving is unimplemented currently for this
+type videoMedia struct {
+	Playback_url string `json:"playback_url"`
+	Created_date int64  `json:"created_date"`
+	Has_audio    bool   `json:"has_audio"`
+	Width        int    `json:"width"`
+	Height       int    `json:"height"`
+}
+
+func (v videoMedia) GetURL() string {
+	return v.Playback_url
+}
+
+func (v videoMedia) GetUploadDate() int64 {
+	return v.Created_date / 1000
+}
+
+func (v videoMedia) IsVideo() bool {
+	return true
+}
+
+func (v videoMedia) GetFilename() (string, error) {
+	uploadDate := strconv.FormatInt(v.GetUploadDate(), 10)
+	const trimLength = 10
+	if len(uploadDate) > trimLength {
+		uploadDate = uploadDate[:trimLength]
+	}
+
+	return fmt.Sprintf("%s.mp4", uploadDate), nil
+}
+
+func (v videoMedia) Save(folderPath string) error {
+	// TODO: Implement video saving with m3u8 playlists, may need to
+	// use ffmpeg...
+	log.Printf("Video media downloading new yet implemented, URL is %s\n", v.GetURL())
+	return nil
+}
+
+func (mw *mediaWrapper) UnmarshalJSON(data []byte) error {
 	var rawJson map[string]json.RawMessage
 
 	if err := json.Unmarshal(data, &rawJson); err != nil {
@@ -60,14 +149,36 @@ func (mw *MediaWrapper) UnmarshalJSON(data []byte) error {
 		}
 	}
 
-	mediaBytes, exists := rawJson[mw.Type]
+	var mediaBytes json.RawMessage
+	var exists bool
+
+	// Handle different media types
+	switch mw.Type {
+	case "image":
+		mediaBytes, exists = rawJson["image"]
+		if exists {
+			var imageMedia imageMedia
+			if err := json.Unmarshal(mediaBytes, &imageMedia); err != nil {
+				return fmt.Errorf("Failed to unmarshal image: %w", err)
+			}
+			mw.Media = imageMedia
+		}
+	case "video":
+		mediaBytes, exists = rawJson["video"]
+		if exists {
+			var videoMedia videoMedia
+			if err := json.Unmarshal(mediaBytes, &videoMedia); err != nil {
+				return fmt.Errorf("Failed to unmarshal video: %w", err)
+			}
+			mw.Media = videoMedia
+		}
+	default:
+		fmt.Printf("Unknown media type %s detected, skipping...\n", mw.Type)
+		return nil
+	}
 
 	if !exists {
 		return fmt.Errorf("Missing key matching media type: %s", mw.Type)
-	}
-
-	if err := json.Unmarshal(mediaBytes, &mw.Media); err != nil {
-		return fmt.Errorf("Failed to unmarshal media of type %s: %w", mw.Type, err)
 	}
 
 	return nil
@@ -81,7 +192,9 @@ type Scraper struct {
 }
 
 const (
-	PageSize = 100
+	// The actual webpage seems to use 14 here, but the upper bound seems
+	// to actually be 30 - use this to keep num of requests down
+	PageSize = 30
 )
 
 func NewScraper(username string, numWorkers int) *Scraper {
@@ -118,29 +231,32 @@ func (scraper *Scraper) GetUserInfo() error {
 	return nil
 }
 
-func (scraper *Scraper) fetchImageList() ([]Media, error) {
-	var list []Media
+func (scraper *Scraper) fetchMediaList() ([]mediaItem, error) {
+	var list []mediaItem
 
 	nextCursor := ""
 	for page := 1; ; page++ {
-		url := fmt.Sprintf("https://vsco.co/api/3.0/medias/profile?site_id=%d&limit=%d&cursor=%s", scraper.id, PageSize, nextCursor)
+		url := fmt.Sprintf("https://vsco.co/api/3.0/medias/profile?site_id=%d&limit=%d&cursor=%s", scraper.id, PageSize, url.QueryEscape(nextCursor))
 		resp, err := client.Get(url)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to get image list for user %s (page %d): %w\n", scraper.username, page, err)
+			return nil, fmt.Errorf("Failed to get media list for user %s (page %d): %w\n", scraper.username, page, err)
 		}
 
-		var curPage imageList
+		var curPage mediaList
+
 		err = json.NewDecoder(resp.Body).Decode(&curPage)
 		resp.Body.Close()
 
 		nextCursor = curPage.Next_cursor
 
 		if err != nil {
-			return nil, fmt.Errorf("Failed to decode JSON imagelist response for user %s: %w\n", scraper.username, err)
+			return nil, fmt.Errorf("Failed to decode JSON media list response for user %s: %w\n", scraper.username, err)
 		}
 
 		for _, item := range curPage.Media {
-			list = append(list, item.Media)
+			if item.Media != nil {
+				list = append(list, item.Media)
+			}
 		}
 
 		// No more new pages
@@ -152,7 +268,6 @@ func (scraper *Scraper) fetchImageList() ([]Media, error) {
 	return list, nil
 }
 
-// vsco returns us links that doesn't have https:// in front of it
 func fixUrl(rawUrl string) (fixedUrl string) {
 	if strings.HasPrefix(rawUrl, "https://") {
 		return rawUrl
@@ -160,58 +275,41 @@ func fixUrl(rawUrl string) (fixedUrl string) {
 	return "https://" + rawUrl
 }
 
-func getCorrectUrl(media Media) (url string) {
-	if media.Is_video {
-		return media.Video_url
-	}
-	return media.Responsive_url
-}
-
-func getMediaFilename(media Media) (string, error) {
-	mediaUrl := getCorrectUrl(media)
-
-	parsed, err := url.Parse(mediaUrl)
-	if err != nil {
-		return "", fmt.Errorf("Failed to parse image URL for media %s: %w\n", media.Responsive_url, err)
-	}
-
-	// Trim to unix seconds
-	uploadDate := strconv.Itoa(media.Upload_date)[:10]
-
-	fileExt := path.Ext(parsed.Path)
-	return fmt.Sprintf("%s%s", uploadDate, fileExt), nil
-}
-
-func SaveMediaToFile(media Media, folderPath string) error {
-	// Determine if we're saving an image or video
-	mediaUrl := getCorrectUrl(media)
+func saveMediaToFile(media mediaItem, folderPath string) error {
+	mediaUrl := media.GetURL()
 	mediaUrl = fixUrl(mediaUrl)
 
-	imageFile, err := getMediaFilename(media)
+	mediaFile, err := media.GetFilename()
 	if err != nil {
 		return err
 	}
 
-	imagePath := path.Join(folderPath, imageFile)
+	mediaPath := path.Join(folderPath, mediaFile)
 
-	err = client.DownloadFile(mediaUrl, imagePath)
+	err = client.DownloadFile(mediaUrl, mediaPath)
 	if err != nil {
-		return fmt.Errorf("Failed to download image %s: %w\n", mediaUrl, err)
+		return fmt.Errorf("Failed to download media %s: %w\n", mediaUrl, err)
 	}
 
 	// We care about the modification time
-	imageTime := time.Unix(int64(media.Upload_date)/int64(1000), 0)
-	os.Chtimes(imagePath, imageTime, imageTime)
+	var mediaTime time.Time
+	uploadDate := media.GetUploadDate()
+	if uploadDate != 0 {
+		mediaTime = time.Unix(uploadDate/1000, 0)
+	} else {
+		mediaTime = time.Now()
+	}
+
+	os.Chtimes(mediaPath, mediaTime, mediaTime)
 
 	return nil
 }
 
-func stripExistingMedia(mediaList []Media, userPath string) ([]Media, error) {
-	var strippedList []Media
+func stripExistingMedia(mediaList []mediaItem, userPath string) ([]mediaItem, error) {
+	var strippedList []mediaItem
 
 	for _, media := range mediaList {
-		mediaFilename, err := getMediaFilename(media)
-
+		mediaFilename, err := media.GetFilename()
 		if err != nil {
 			return nil, err
 		}
@@ -242,7 +340,7 @@ func createUserDirectory(username string) (string, error) {
 }
 
 func (scraper *Scraper) SaveAllMedia() error {
-	mediaList, err := scraper.fetchImageList()
+	mediaList, err := scraper.fetchMediaList()
 	if err != nil {
 		return err
 	}
@@ -262,18 +360,18 @@ func (scraper *Scraper) SaveAllMedia() error {
 	var sem = make(chan int, scraper.numWorkers)
 	var wg sync.WaitGroup
 
-	bar := progressbar.Default(int64(len(mediaList)), fmt.Sprintf("Downloading images from %s...", scraper.username))
+	bar := progressbar.Default(int64(len(mediaList)), fmt.Sprintf("Downloading media from %s...", scraper.username))
 	for _, media := range mediaList {
 		sem <- 1
 		wg.Add(1)
-		go func(media Media) {
+		go func(media mediaItem) {
 			defer func() {
 				<-sem
 				wg.Done()
 				bar.Add(1)
 			}()
 
-			err := SaveMediaToFile(media, userPath)
+			err := media.Save(userPath)
 			// Keeps going and logs if one fails (maybe make threshold of failures)
 			if err != nil {
 				log.Print(err)
